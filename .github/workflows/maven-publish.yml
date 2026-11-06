@@ -4,6 +4,7 @@
 name: Maven Package
 
 on:
+  workflow_dispatch:
   push:
     branches: [ "master" ]
   pull_request:
@@ -11,16 +12,18 @@ on:
 
 permissions:
     contents: read
-    checks: write
-    id-token: write
 
 jobs:
   build:
 
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      checks: write
+      packages: read
 
     steps:
-    - uses: actions/checkout@v3
+    - uses: actions/checkout@v4
     - name: Set up JDK 17
       uses: actions/setup-java@v3
       with:
@@ -28,10 +31,13 @@ jobs:
         distribution: 'temurin'
         cache: maven
     - name: Build with Maven
+      # The repository secrets USER_NAME/ACCESS_TOKEN are not configured, which made
+      # every build fail with "401 Unauthorized" while resolving de.swa:gmaf-mvr.
+      # The workflow-scoped token is sufficient to read the dependency.
       run: mvn -B  --no-transfer-progress package -s $GITHUB_WORKSPACE/.github/workflows/maven-settings.xml -P github --file pom.xml
       env:
-        USER_NAME: ${{ secrets.USER_NAME }}
-        ACCESS_TOKEN: ${{ secrets.ACCESS_TOKEN }}
+        USER_NAME: ${{ github.actor }}
+        ACCESS_TOKEN: ${{ github.token }}
     - name: JUnit Report Action
       uses: mikepenz/action-junit-report@v3.7.6
       with:
@@ -41,6 +47,9 @@ jobs:
 
   publish-snapshot:
     needs: build
+    # Publishing is only meaningful for commits on master; pull requests must not write
+    # to GitHub Packages.
+    if: github.event_name == 'push' && github.ref == 'refs/heads/master'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -56,9 +65,34 @@ jobs:
         server-id: github # Value of the distributionManagement/repository/id field of the pom.xml
         settings-path: ${{ github.workspace }} # location for the settings.xml file
 
+    # The pom publishes to https://maven.pkg.github.com/marquies/gmaf-mvr, i.e. the
+    # registry of another repository. The workflow token cannot write there (403),
+    # so a personal access token with write:packages is required.
+    - name: Check package token
+      id: package-token
+      env:
+        PACKAGES_TOKEN: ${{ secrets.PACKAGES_TOKEN }}
+      run: |
+        if [ -z "$PACKAGES_TOKEN" ]; then
+          echo "::warning::Repository secret PACKAGES_TOKEN is not set - publishing to GitHub Packages is skipped."
+          echo "Publishing skipped: the repository secret PACKAGES_TOKEN (PAT with write:packages on marquies/gmaf-mvr) is not configured." >> "$GITHUB_STEP_SUMMARY"
+          echo "available=false" >> "$GITHUB_OUTPUT"
+        else
+          echo "available=true" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Set unique package version from commit
+      if: steps.package-token.outputs.available == 'true'
+      # GitHub Packages refuses to overwrite an already published version (409 Conflict),
+      # therefore every run deploys a version that is unique per commit.
+      run: |
+        BASE_VERSION=$(mvn -B --no-transfer-progress help:evaluate -Dexpression=project.version -q -DforceStdout | sed 's/-SNAPSHOT$//')
+        mvn -B --no-transfer-progress versions:set -DnewVersion="${BASE_VERSION}-${GITHUB_SHA::7}" -DgenerateBackupPoms=false
+
     - name: Publish to GitHub Packages Apache Maven
+      if: steps.package-token.outputs.available == 'true'
       run: mvn -B --no-transfer-progress deploy -DskipTests -s $GITHUB_WORKSPACE/.github/workflows/maven-settings.xml -P github
       env:
-        GITHUB_TOKEN: ${{ github.token }}
-        USER_NAME: ${{ secrets.USER_NAME }}
-        ACCESS_TOKEN: ${{ secrets.ACCESS_TOKEN }}
+        GITHUB_TOKEN: ${{ secrets.PACKAGES_TOKEN }}
+        USER_NAME: ${{ github.repository_owner }}
+        ACCESS_TOKEN: ${{ secrets.PACKAGES_TOKEN }}
